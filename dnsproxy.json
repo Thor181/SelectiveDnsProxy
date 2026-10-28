@@ -1,0 +1,17 @@
+{
+  "ListenAddress": "127.0.0.1",
+  "Port": 53,
+  "TimeoutMs": 2500,
+  "DefaultUpstream": [ "10.46.7.36", "10.46.7.37" ],
+  "RouteAddress": "127.0.0.1",
+  "HttpPort": 80,
+  "HttpsPort": 443,
+  "Routes": [
+    {
+      "Host": "address.ru",
+      "SshHost": "user@addres",
+      "SshKey": "C:\\Users\\user\\.ssh\\id_ed25519"
+    }
+  ],
+  "Rules": []
+}
