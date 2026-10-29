@@ -10,7 +10,11 @@
     {
       "Host": "address.ru",
       "SshHost": "user@addres",
-      "SshKey": "C:\\Users\\user\\.ssh\\id_ed25519"
+      "SshKey": "C:\\Users\\user\\.ssh\\id_ed25519",
+      "SshForwards": {
+        "5777": "localhost:5777"
+      }
+
     }
   ],
   "Rules": []

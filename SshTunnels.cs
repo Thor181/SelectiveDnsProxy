@@ -25,7 +25,8 @@ internal sealed class SshTunnels
             {
                 using var process = Process.Start(BuildStartInfo(route))
                                     ?? throw new InvalidOperationException("ssh не запустился.");
-                Console.WriteLine($"SSH {route.Host}: туннель через {route.SshHost} -> {route.RemoteHost} (80 -> :{route.HttpTargetPort}, 443 -> :{route.HttpsTargetPort})");
+                var forwards = string.Join(", ", route.Ports.Select(p => $"{p.Key} -> :{p.Value.LocalPort} -> {p.Value.Remote}"));
+                Console.WriteLine($"SSH {route.Host}: туннель через {route.SshHost} ({forwards})");
                 process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Console.Error.WriteLine($"SSH {route.Host}: {e.Data}"); };
                 process.BeginErrorReadLine();
                 try { await process.WaitForExitAsync(token); }
@@ -71,10 +72,11 @@ internal sealed class SshTunnels
             info.ArgumentList.Add(arg);
         if (route.SshPort is { } port) { info.ArgumentList.Add("-p"); info.ArgumentList.Add(port.ToString()); }
         if (!string.IsNullOrWhiteSpace(route.SshKey)) { info.ArgumentList.Add("-i"); info.ArgumentList.Add(route.SshKey); }
-        info.ArgumentList.Add("-L");
-        info.ArgumentList.Add($"{route.TargetHost}:{route.HttpTargetPort}:{route.RemoteHost}:80");
-        info.ArgumentList.Add("-L");
-        info.ArgumentList.Add($"{route.TargetHost}:{route.HttpsTargetPort}:{route.RemoteHost}:443");
+        foreach (var forward in route.Ports.Values)
+        {
+            info.ArgumentList.Add("-L");
+            info.ArgumentList.Add($"{route.TargetHost}:{forward.LocalPort}:{forward.Remote}");
+        }
         info.ArgumentList.Add(route.SshHost!);
         return info;
     }

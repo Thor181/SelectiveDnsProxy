@@ -43,12 +43,28 @@ internal static class Program
         var tasks = new List<Task> { server.RunAsync(cts.Token) };
         if (config.Routes.Count > 0) tasks.Add(new TcpRouter(config).RunAsync(cts.Token));
         if (config.Routes.Any(r => r.SshHost is not null)) tasks.Add(new SshTunnels(config).RunAsync(cts.Token));
-        try { await Task.WhenAll(tasks); }
+        try { await ServiceTasks.RunAsync(tasks, cts); }
         catch (OperationCanceledException) { }
         catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
         {
-            Console.Error.WriteLine($"Порт {config.Port} уже занят. Запустите от администратора и проверьте другие DNS-службы.");
+            Console.Error.WriteLine($"Не удалось запустить службы: адрес/порт уже занят. {ex.Message}");
             Environment.ExitCode = 2;
+        }
+    }
+}
+
+internal static class ServiceTasks
+{
+    // Stop sibling listeners before awaiting them, including when startup failed synchronously.
+    public static async Task RunAsync(IEnumerable<Task> services, CancellationTokenSource lifetime)
+    {
+        var tasks = services.ToArray();
+        try { await await Task.WhenAny(tasks); }
+        finally
+        {
+            lifetime.Cancel();
+            try { await Task.WhenAll(tasks); }
+            catch { /* The first completed task supplies the original failure. */ }
         }
     }
 }
@@ -65,11 +81,16 @@ internal sealed class DnsProxyConfig
     public int HttpsPort { get; set; } = 443;
     public List<HostRoute> Routes { get; set; } = [];
 
-    public HostRoute? FindRoute(string host)
+    /// <summary>Все порты, на которых слушает роутер.</summary>
+    [JsonIgnore] public IEnumerable<int> RouterPorts => Routes.SelectMany(r => r.Ports.Keys).Distinct().Order();
+
+    /// <summary>Маршрут для хоста; при заданном port — только среди маршрутов, обслуживающих этот входящий порт.</summary>
+    public HostRoute? FindRoute(string host, int? port = null)
     {
         host = host.TrimEnd('.').ToLowerInvariant();
         return Routes
             .Where(r => host == r.Host || (r.IncludeSubdomains && host.EndsWith("." + r.Host)))
+            .Where(r => port is null || r.Ports.ContainsKey(port.Value))
             .OrderByDescending(r => r.Host.Length)
             .FirstOrDefault();
     }
@@ -98,7 +119,9 @@ internal sealed class DnsProxyConfig
             route.Host = route.Host.Trim().TrimEnd('.').ToLowerInvariant();
             if (string.IsNullOrWhiteSpace(route.Host) || route.Host.Contains('/') || route.Host.Contains(' '))
                 throw new InvalidOperationException($"Некорректный Host в маршруте: '{route.Host}'.");
-            route.ParseTarget();
+            route.ParseTarget(HttpPort, HttpsPort);
+            if (route.Ports.ContainsKey(Port))
+                throw new InvalidOperationException($"Маршрут '{route.Host}': порт {Port} занят самим DNS-прокси.");
         }
         foreach (var rule in Rules)
         {
@@ -129,15 +152,20 @@ internal sealed class HostRoute
     public string? SshHost { get; set; }
     public int? SshPort { get; set; }
     public string? SshKey { get; set; }
-    /// <summary>Хост, к которому SSH-сервер подключается по 80/443. По умолчанию — сам Host.</summary>
+    /// <summary>Хост, к которому SSH-сервер подключается по 80/443. По умолчанию — сам Host. Не сочетается с SshForwards.</summary>
     public string? SshRemoteHost { get; set; }
+    /// <summary>
+    /// Входящий порт роутера → адрес "host:port", к которому подключается SSH-сервер.
+    /// По умолчанию: HttpPort → RemoteHost:80, HttpsPort → RemoteHost:443.
+    /// </summary>
+    public Dictionary<int, string>? SshForwards { get; set; }
 
     [JsonIgnore] public string RemoteHost => string.IsNullOrWhiteSpace(SshRemoteHost) ? Host : SshRemoteHost;
     [JsonIgnore] public string TargetHost { get; private set; } = "127.0.0.1";
-    [JsonIgnore] public int HttpTargetPort { get; private set; }
-    [JsonIgnore] public int HttpsTargetPort { get; private set; }
+    /// <summary>Входящий порт роутера → локальный порт (туннеля или Target) и удалённый адрес для SSH.</summary>
+    [JsonIgnore] public Dictionary<int, PortForward> Ports { get; } = [];
 
-    public void ParseTarget()
+    public void ParseTarget(int httpPort, int httpsPort)
     {
         if (string.IsNullOrWhiteSpace(SshHost)) SshHost = null;
         if (SshHost is not null && (SshHost.StartsWith('-') || SshHost.Contains(' ')))
@@ -146,21 +174,43 @@ internal sealed class HostRoute
         if (!string.IsNullOrWhiteSpace(SshRemoteHost) &&
             (SshRemoteHost.StartsWith('-') || SshRemoteHost.Contains(' ') || SshRemoteHost.Contains(':')))
             throw new InvalidOperationException($"Маршрут '{Host}': SshRemoteHost должен быть именем хоста без порта.");
+        if (SshForwards is not null && !string.IsNullOrWhiteSpace(SshRemoteHost))
+            throw new InvalidOperationException($"Маршрут '{Host}': укажите либо SshForwards, либо SshRemoteHost.");
+        var defaultPorts = new[] { httpPort, httpsPort }.Where(p => p > 0).Distinct().ToList();
 
         if (SshHost is not null)
         {
             if (!string.IsNullOrWhiteSpace(Target))
                 throw new InvalidOperationException($"Маршрут '{Host}': при заданном SshHost поле Target не используется — удалите его.");
-            HttpTargetPort = GetFreePort();
-            HttpsTargetPort = GetFreePort();
-            return;
+            var forwards = SshForwards ?? defaultPorts.ToDictionary(p => p, p => $"{RemoteHost}:{(p == httpPort ? 80 : 443)}");
+            foreach (var (port, remote) in forwards)
+            {
+                if (port is < 1 or > 65535) throw new InvalidOperationException($"Маршрут '{Host}': некорректный порт {port} в SshForwards.");
+                if (!TryParseHostPort(remote, out _, out _))
+                    throw new InvalidOperationException($"Маршрут '{Host}': адрес '{remote}' для порта {port} должен быть в формате host:port.");
+                Ports[port] = new PortForward(GetFreePort(), remote.Trim());
+            }
+        }
+        else
+        {
+            if (SshForwards is not null) throw new InvalidOperationException($"Маршрут '{Host}': SshForwards работает только с SshHost.");
+            if (!TryParseHostPort(Target, out var targetHost, out var targetPort))
+                throw new InvalidOperationException($"Маршрут '{Host}': нужен SshHost либо Target в формате host:port.");
+            TargetHost = targetHost;
+            foreach (var port in defaultPorts) Ports[port] = new PortForward(targetPort, null);
         }
 
-        var colon = Target?.LastIndexOf(':') ?? -1;
-        if (colon <= 0 || !int.TryParse(Target![(colon + 1)..], out var port) || port is < 1 or > 65535)
-            throw new InvalidOperationException($"Маршрут '{Host}': нужен SshHost либо Target в формате host:port.");
-        TargetHost = Target[..colon];
-        HttpTargetPort = HttpsTargetPort = port;
+        if (Ports.Count == 0) throw new InvalidOperationException($"Маршрут '{Host}': не задано ни одного порта.");
+    }
+
+    private static bool TryParseHostPort(string? value, out string host, out int port)
+    {
+        value = value?.Trim();
+        var colon = value?.LastIndexOf(':') ?? -1;
+        host = colon > 0 ? value![..colon] : "";
+        port = 0;
+        return colon > 0 && !host.StartsWith('-') && !host.Contains(' ') &&
+               int.TryParse(value![(colon + 1)..], out port) && port is >= 1 and <= 65535;
     }
 
     private static int GetFreePort()
@@ -171,6 +221,10 @@ internal sealed class HostRoute
         finally { listener.Stop(); }
     }
 }
+
+/// <param name="LocalPort">Локальный порт на TargetHost, куда роутер пересылает соединение.</param>
+/// <param name="Remote">"host:port", к которому подключается SSH-сервер; null — маршрут без туннеля.</param>
+internal sealed record PortForward(int LocalPort, string? Remote);
 
 internal sealed class DnsRule
 {
@@ -201,7 +255,7 @@ internal sealed class DnsProxyServer
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
         var udpTask = RunUdpAsync(udp, linked.Token);
         var tcpTask = RunTcpAsync(tcpListener, linked.Token);
-        try { await Task.WhenAll(udpTask, tcpTask); }
+        try { await ServiceTasks.RunAsync([udpTask, tcpTask], linked); }
         finally { linked.Cancel(); tcpListener.Stop(); }
     }
 
@@ -313,9 +367,13 @@ internal sealed class DnsProxyServer
     private async Task<byte[]> ForwardUdpAsync(IPAddress upstream, byte[] query, CancellationToken token)
     {
         using var client = new UdpClient(upstream.AddressFamily);
-        await client.SendAsync(query, new IPEndPoint(upstream, 53), token);
-        var result = await client.ReceiveAsync(token);
-        return result.Buffer;
+        client.Connect(new IPEndPoint(upstream, 53));
+        await client.SendAsync(query, token);
+        while (true)
+        {
+            var result = await client.ReceiveAsync(token);
+            if (DnsWire.IsResponseTo(query, result.Buffer)) return result.Buffer;
+        }
     }
 
     private static async Task<byte[]> ForwardTcpAsync(IPAddress upstream, byte[] query, CancellationToken token)
@@ -331,6 +389,7 @@ internal sealed class DnsProxyServer
         var length = BinaryPrimitives.ReadUInt16BigEndian(prefix);
         var response = new byte[length];
         await stream.ReadExactlyAsync(response, token);
+        if (!DnsWire.IsResponseTo(query, response)) throw new IOException("DNS upstream returned an unrelated response.");
         return response;
     }
 }
@@ -339,6 +398,14 @@ internal sealed record DnsQuestion(string Name, ushort Type, ushort Class, int E
 
 internal static class DnsWire
 {
+    internal static bool IsResponseTo(byte[] query, byte[] response) =>
+        response.Length >= 12 && query.Length >= 12 &&
+        response.AsSpan(0, 2).SequenceEqual(query.AsSpan(0, 2)) &&
+        (response[2] & 0x80) != 0 && (response[2] & 0x78) == (query[2] & 0x78) &&
+        response.AsSpan(4, 2).SequenceEqual(query.AsSpan(4, 2)) &&
+        TryReadQuestion(query, out var expected) && TryReadQuestion(response, out var actual) &&
+        expected.Name == actual.Name && expected.Type == actual.Type && expected.Class == actual.Class;
+
     public static bool TryReadQuestion(byte[] packet, out DnsQuestion question)
     {
         question = new DnsQuestion("", 0, 0, 0);
